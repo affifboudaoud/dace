@@ -73,9 +73,10 @@ setup(name='dace',
       },
       include_package_data=True,
       install_requires=[
-         'numpy', 'networkx >= 2.5', 'astunparse', 'sympy >= 1.9', 'pyyaml', 'ply', 'websockets', 'jinja2',
-          'fparser >= 0.1.3', 'aenum >= 3.1', 'dataclasses; python_version < "3.7"', 'dill',
-          'pyreadline;platform_system=="Windows"', 'typing-compat; python_version < "3.8"'
+          'numpy == 1.23.1', 'networkx >= 2.5', 'astunparse', 'sympy >= 1.9', 'onnx', 'onnxsim', 'pyyaml', 'ply', 'websockets',
+          'jinja2', 'fparser >= 0.1.3', 'aenum >= 3.1', 'dataclasses; python_version < "3.7"', 'dill',
+          'pyreadline;platform_system=="Windows"', 'typing-compat; python_version < "3.8"',
+          'onnx == 1.7.0', 'torch == 1.8.1', 'onnx-simplifier == 0.3.10', 'protobuf == 3.19',
       ] + cmake_requires,
       extras_require={
           'testing': ['coverage', 'pytest-cov', 'scipy', 'absl-py', 'opt_einsum', 'pymlir', 'click'],
