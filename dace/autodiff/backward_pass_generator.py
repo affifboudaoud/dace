@@ -595,10 +595,10 @@ class BackwardPassGenerator:
             gradient contributions of all nodes that are not connected by a path to a ``given_gradient`` node are
             implicitly zero. Thus, we take the intersection of the two BFSs.
         """
-        forward_nodes = {n for e in self.forward_state.bfs_edges(self.required_gradients) for n in [e.src, e.dst]}
+        forward_nodes = {n for e in self.forward_state.edge_bfs(self.required_gradients) for n in [e.src, e.dst]}
         backward_nodes = {
             n
-            for e in self.forward_state.bfs_edges(self.given_gradients, reverse=True)
+            for e in self.forward_state.edge_bfs(self.given_gradients, reverse=True)
             for n in [e.src, e.dst]
         }
 
