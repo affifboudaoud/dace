@@ -294,7 +294,7 @@ class BackwardPassGenerator:
         self.array_grad_map: Dict[str, str] = array_grad_map or {}
 
         # Topological orderning of the states
-        self.state_order = self.sdfg.states()
+        self.state_order: List[SDFGState] = self.sdfg.states()
         self.conflicted_gradient_buffers: Set[str] = conflicted_gradient_buffers or set()
 
         # Variable to check if backward has already been applied
@@ -390,6 +390,9 @@ class BackwardPassGenerator:
 
         # Forward required data by the backward pass according to a user defined strategy
         self._forward_data_to_backward_states()
+        
+        # Some issues in the backward SDFG are better fixed after all the other passes are done
+        self._run_post_autodiff_fixes()
 
         # In some cases (accessnode -> accessnode), the descriptors for the gradients of the function outputs are not
         # added yet. Add them now.
@@ -936,7 +939,15 @@ class BackwardPassGenerator:
         for index, (forward_state, backward_state, access_node, node, edge) in enumerate(self._forward_data):
             self._connect_forward_accessnode(forward_state, backward_state, access_node, node, edge,
                                              recomputation_nsdfgs[index], strategy_choice[index])
-
+    def _run_post_autodiff_fixes(self):
+        """
+        Execute some post AD fixes on the backward SDFG. 
+        This will consist of matching patterns in the backward SDFG, and adding fixes for specific problems
+        """
+        
+        # Fix multiple map writes to the same data
+        self._fix_multiple_map_writes_to_data()
+        
     def _find_subgraph_to_differentiate(self) -> None:
         """ 
         Determine which nodes we need to reverse; this forms the subgraph we will differentiate:
@@ -2244,34 +2255,13 @@ class BackwardPassGenerator:
                         # this grad hasn't been written before: initialize it
                         self._add_gradient_data_descriptor(node.data)
 
-                    # we need to make all incoming gradients sum
+                    # We need to make all incoming gradients sum
                     if backward_state.in_degree(reversed_node) > 1:
                         summation_node = ONNXSum(f"sum_{array_grad_name}")
 
                         grad_desc = self.backward_sdfg.arrays[array_grad_name]
 
-                        # Check if we need to accumulate gradients over loop iterations
-                        within_loop, _ = self._state_within_loop(forward_state)
-                        if within_loop:
-                            # Check that the values read from this loop should accumelate at each iteration
-                            if self._check_if_loop_summation_should_accumelate(backward_state, reversed_node):
-
-                                # Check that the write is to a golbal array and not a temorary
-                                if not self.backward_sdfg.arrays[reversed_node.data].transient:
-
-                                    # Duplicate the access node
-                                    duplicated_reversed_node = copy.deepcopy(reversed_node)
-
-                                    # Add it to the backward state
-                                    backward_state.add_node(duplicated_reversed_node)
-
-                                    # Connect it to the reversed node
-                                    # This will mean it will be summed in the loop after this block
-                                    backward_state.add_edge(
-                                        duplicated_reversed_node, None, reversed_node, None,
-                                        self.backward_sdfg.make_array_memlet(duplicated_reversed_node.data))
-
-                        # connect each incoming edge to the summation node
+                        # Connect each incoming edge to the summation node
                         for i, edge in enumerate(backward_state.in_edges(reversed_node)):
 
                             intermediate_desc = copy.deepcopy(grad_desc)
@@ -2283,16 +2273,15 @@ class BackwardPassGenerator:
                             access_intermediate = backward_state.add_access(intermediate_name)
                             access_intermediate.setzero = True
                             for mte in backward_state.memlet_tree(edge):
-                                # # whatever edges were writing to the reversed node
+                                # Whatever edges were writing to the reversed node
                                 if mte.data.data == array_grad_name:
-                                    # will now need to write to the intermediate node
+                                    # Will now need to write to the intermediate node
                                     mte.data.data = intermediate_name
 
                             new_edge = backward_state.add_edge(edge.src, edge.src_conn, access_intermediate, None,
                                                                edge.data)
 
-                            # TODO: I don't think you ever need to accumulate gradients here actually
-                            # self._set_wcr_sum_if_needed(forward_state, backward_state, new_edge)
+                            self._accumulate_gradients_if_needed(forward_state, backward_state, new_edge)
 
                             summation_node.add_in_connector(f"data_0__{i}")
                             backward_state.add_edge(access_intermediate, None, summation_node, f"data_0__{i}",
@@ -2313,11 +2302,11 @@ class BackwardPassGenerator:
                             summation_node.schedule = dtypes.ScheduleType.GPU_Default
                         else:
                             raise ValueError(f"Unsupported storage {grad_desc.storage}")
+                        
                     elif backward_state.in_degree(reversed_node) == 1:
-                        self._set_wcr_sum_if_needed(forward_state,
+                        self._accumulate_gradients_if_needed(forward_state,
                                                     backward_state,
-                                                    backward_state.in_edges(reversed_node)[0],
-                                                    summation_node=True)
+                                                    backward_state.in_edges(reversed_node)[0])
 
                 # if this node is a tasklet with a condition, we add some modification to the backward state
                 elif (isinstance(node, nodes.Tasklet)
@@ -2339,11 +2328,18 @@ class BackwardPassGenerator:
                                 reversed_node: nodes.AccessNode, array_grad_name: str):
         """
         """
+        
         read_write_intersection = self._check_write_read_ranges(forward_state=forward_state, forward_node=forward_node)
-        # check if the summation result can be directly assigned to the reversed node
+        
+        # Check if the summation result can be directly assigned to the reversed node
         if not read_write_intersection:
-            new_edge = backward_state.add_edge(summation_node, "sum", reversed_node, None,
+            backward_state.add_edge(summation_node, "sum", reversed_node, None,
                                                self.backward_sdfg.make_array_memlet(array_grad_name))
+            
+            # Accumulate gradients for the sum if necessary
+            self._accumulate_gradients_if_needed(forward_state,
+                                                backward_state,
+                                                backward_state.in_edges(reversed_node)[0])
         else:
             # we need to create an assignement for each peace of data
             # first create an intermediate array
@@ -2355,7 +2351,8 @@ class BackwardPassGenerator:
                                                                 intermediate_desc,
                                                                 find_new_name=True)
             access_intermediate = backward_state.add_access(intermediate_name)
-            # connect it to the summation node
+            
+            # Connect it to the summation node
             backward_state.add_edge(summation_node, "sum", access_intermediate, None,
                                     self.backward_sdfg.make_array_memlet(intermediate_name))
 
@@ -2568,6 +2565,285 @@ class BackwardPassGenerator:
         # connect the output of the tasklet to the in connector
         backward_state.add_edge(new_tasklet, target_in_connector, destination_node, target_in_connector, save_memlet)
 
+    def _get_all_relevant_array_reads_in_sdfg(self, data_node: nodes.AccessNode) -> List[nodes.AccessNode]:
+        """
+        Goes through all the SDFG and returns all reads of data_name in order. 
+        We need to avoid looking at values after they have been overwritten
+        When looking at gradients, if the values of an array are overwritten
+        this is equivelent to dealing with a completely new array.
+        Relevant here means the reads before the occurance of the data_node passed as a parameter up until an overwrite is found.
+        """
+        occurances: List[Tuple] = []
+        # TODO: does the all_nodes_recursive function follow any order? 
+        # Doesn't matter for now but need to investigate
+        
+        # Get all occurances of the data
+        for node, parent in self.sdfg.all_nodes_recursive():
+            if isinstance(node, nodes.AccessNode) and node.data == data_node.data:
+               occurances.append((node, parent)) 
+        
+        # Remove the instances after an overwrite if any
+        index = [node for node, parent in occurances].index(data_node)
+        
+        # By default we don't remove anything
+        cutoff_index = 0
+        for i in reversed(range(index)):
+            node, parent = occurances[i]
+            if parent.in_degree(node) > 0:
+                # There is a write to this data
+                # Check that it is a complete overwrite of the data
+                edges = parent.in_edges(node)
+                
+                # For now, we only deal with an overwrite coming from a single edge
+                assert len(edges) == 1
+                memelt: Memlet = edges[0].data
+                
+                # For now, we only deal with a complete overwrite of the data
+                if not memelt.num_accesses == self.sdfg.arrays[data_node.data].total_size:
+                    print("WARNING! A partial overwrite of data was detected, this might break AD")
+                
+                cutoff_index = i
+                break
+        
+        occurances = occurances[cutoff_index:index+1]
+        return occurances
+    
+    def _fix_multiple_map_writes_to_data(self):
+        """
+        If there are multiple writes from a map exit to the same data through different access nodes
+        We need to add a summation node to sum the different contributions.
+        This should only happen in the case of different views of the data but we will treat the general case here.
+        """
+        from dace.libraries.onnx.nodes.onnx_op import ONNXSum  # avoid import loop
+        
+        # Iterate through all the map exists in the backward pass
+        for fwd_node, bwd_node in self.reverse_map.items():
+            if isinstance(bwd_node, nodes.MapExit):
+                # TODO: Faster way of finding the parent of a map exit
+                for node, node_parent in self.backward_sdfg.all_nodes_recursive():
+                    if node == bwd_node:
+                        parent = node_parent
+                        break
+                    
+                # Get all the out edges from this map exist
+                out_edges = parent.out_edges(bwd_node)
+                
+                if len(out_edges) == 1:
+                    continue
+                
+                
+                # Iterate through the out edges and check the data written to
+                data_to_fix: Dict[str: Tuple[List[nodes.AccessNode], SDFGState]] = {}
+                for edge in out_edges:
+                    edge_dst = edge.dst
+                    if isinstance(edge_dst, nodes.AccessNode):
+                                                
+                        # If this is a view
+                        if isinstance(self.backward_sdfg.arrays[edge_dst.data], dt.ArrayView):
+                            
+                            # We want to trace down the view until we find the actual data it writes to
+                            while isinstance(self.backward_sdfg.arrays[edge_dst.data], dt.ArrayView):
+                                child_edge = parent.out_edges(edge_dst)   
+                                
+                                # Since this is a view it should have a single edge out
+                                assert len(child_edge) == 1
+                                
+                                edge_dst = child_edge[0].dst
+                                assert isinstance(edge_dst, nodes.AccessNode)
+
+                            if edge_dst.data not in list(data_to_fix.keys()):
+                                data_to_fix[edge_dst.data] = ([edge_dst], parent)
+                            else:
+                                data_to_fix[edge_dst.data][0].append(edge_dst)
+
+                # If there is no data to be fixed
+                # i.e. if none of the data is written to more than once
+                if not any(len(v)>1 for _,(v,_) in data_to_fix.items()):
+                    # Move on to the next map exit
+                    continue
+                
+                # Fix each unique data write with a summation node
+                for data, (instances, parent) in data_to_fix.items():
+                    if len(instances) < 2:
+                        continue
+                    # Create the sum node for this data
+                    summation_node = ONNXSum(f"sum_{data}")
+                    
+                    backward_state: SDFGState = parent
+                    
+                    node_to_write_sum_to = copy.deepcopy(instances[0])
+                    # Get the last view before the Access node
+                    for i, inst in enumerate(instances):
+        
+                        # There is only one incoming edge to this AccessNode
+                        edge = backward_state.in_edges(inst)[0]
+                        
+                        grad_desc = self.backward_sdfg.arrays[data]
+                        intermediate_desc = copy.deepcopy(grad_desc)
+
+                        intermediate_desc.transient = True
+                        intermediate_name = self.backward_sdfg.add_datadesc(f"{data}_contribution_{i}",
+                                                                            intermediate_desc,
+                                                                            find_new_name=True)
+                        access_intermediate = backward_state.add_access(intermediate_name)
+                        access_intermediate.setzero = True
+                        for mte in backward_state.memlet_tree(edge):
+                            # Whatever edges were writing to the reversed node
+                            if mte.data.data == data:
+                                # Will now need to write to the intermediate node
+                                mte.data.data = intermediate_name
+
+                        backward_state.add_edge(edge.src, edge.src_conn, access_intermediate, None,
+                                                            edge.data)
+
+                        summation_node.add_in_connector(f"data_0__{i}")
+                        backward_state.add_edge(access_intermediate, None, summation_node, f"data_0__{i}",
+                                                self.backward_sdfg.make_array_memlet(intermediate_name))
+                        backward_state.remove_edge(edge)
+                        backward_state.remove_node(inst)
+                    
+                    # Write the sum to the AccessNode    
+                    backward_state.add_edge(summation_node, "sum", node_to_write_sum_to, None,
+                                               self.backward_sdfg.make_array_memlet(data))
+                    
+                    
+                
+                            
+    def _accumulate_gradients_if_needed(self,
+                               forward_state: SDFGState,
+                               backward_state: SDFGState,
+                               edge: dgraph.MultiConnectorEdge):
+        """
+        If data was read in the forward pass this means it contributes to the output somehow.
+
+        First, lets consider cases where there are no loops.In this case if values are read once then they are used once. I.e. a single memlet out of the AccessNode doesnt require accumulation.
+        Let A be an array in the SDFG. The reads from this array are assumed to read all of its values. A special case to deal with reading a subset is necessary and will be treated later. 
+
+        Case 1 - no loops:
+        A is only read once in the whole SDFG  
+            No WCR edge is necessary, we write the values of the gradient directly
+
+
+        Case 2 - no loops:
+        A is read n times in the SDFG in different AccessNodes
+        A WCR edge is necessary for the first n-1 reads in the SDFG
+        As a simplification, we can say that if A is read from multiple times, we need n WCR edges with the gradient_A array initialized to 0. This might hurt performance however. 
+
+        Case 3 - no loops:
+            A has a single read in the form of a memlet going to a map and this read value is used n times 
+            A WCR edge is necessary when writing to gradient A in the backward map to accumulate the different ways it was used
+
+        """
+        # The decision of wether to add a wcr or not will largely be based on the data to write
+        bwd_target_node = edge.dst
+        assert isinstance(bwd_target_node, nodes.AccessNode)
+        
+        # By default, we don't add a WCR and we only look for cases where it is necessary
+        add_wcr = False
+        
+        bwd_source_node = edge.src
+        if isinstance(bwd_source_node, nodes.AccessNode):
+            # There should never be a wcr in a memory transfer
+            # Unless this is a temporary to an array transfer
+            if self.backward_sdfg.arrays[bwd_source_node.data].transient:
+                # Here we want to move any wcr from the temorary to this write
+                source_edge = backward_state.in_edges(bwd_source_node)
+                
+                # Since this is an AccessNode there should only be one edge at most
+                if len(source_edge) == 1:
+                    source_edge = source_edge[0]
+                    if source_edge.data.wcr is not None:
+                        add_wcr = True
+            else:
+                return
+        
+        # Get the forward data
+        fwd_target_node = next((k for k, v in self.reverse_map.items() if v == bwd_target_node), None)
+        
+        if fwd_target_node is None:
+            # Some nodes we add in the backward pass are not reversed.
+            # An example of this is the contributions nodes added for summation nodes
+            # These don't require any wcr
+            return
+        assert isinstance(fwd_target_node, nodes.AccessNode)
+        
+        # Look for case 3: are there multiple reads in this instance itself
+        for path_edge in backward_state.memlet_tree(edge):
+            # Count the amount of in edges per connector
+            connector_in_edges = collections.defaultdict(int)
+            explored = {}
+            for _, _, _, dst_conn, _ in backward_state.in_edges(path_edge.dst):
+                connector_in_edges[dst_conn] += 1
+                explored[dst_conn] = False
+
+            more_than_one_edge_to_connector = any(v > 1 for v in connector_in_edges.values())
+
+            if more_than_one_edge_to_connector:
+                # Instead of setting a WCR edge, we will add a summation tasklet to sum the elements
+                # and return a single edge to the connector
+                for _, _, _, dst_conn, _ in backward_state.in_edges(path_edge.dst):
+                    if connector_in_edges[dst_conn] > 1 and not explored[dst_conn]:
+                        self._fix_multiple_in_edges_to_connector(backward_state, path_edge.dst, dst_conn)
+                        explored[dst_conn] = True
+                
+        # Look for Case 2, are there any other reads of this data
+        all_reads = self._get_all_relevant_array_reads_in_sdfg(fwd_target_node)
+        
+        # Sanity check: There should be at least one read
+        # And this is the node we are currently investigating
+        assert len(all_reads) > 0
+        if len(all_reads) == 1:
+            # all_reads = [(node, parent), ...] 
+            assert all_reads[0][0] == fwd_target_node
+            # Case 1: The data is only read once, no WCR edge needed
+            # Check if a loop is involved in the parts we care about
+            within_loop, loop = self._state_within_loop(forward_state)
+            if within_loop:
+                # First, we check if there isn't a complete overwrite of this array within the same loop
+                overwritten = self._check_overwrite_within_loop_for_accumulation(forward_state=forward_state, forward_node=fwd_target_node, forward_loop=loop)
+                
+                if not overwritten:
+                    add_wcr = True
+        else:
+            # Case 2: the data is read multiple times
+            # Add a wcr and an initialization of the array
+            add_wcr = True
+            bwd_target_node.setzero = True
+            
+        inverse_array_grad_map = {v: k for k, v in self.array_grad_map.items()}
+       
+        # This method assumes that the memlet tree is iterated from the root backwards
+        for path_edge in backward_state.memlet_tree(edge):
+            data_name = path_edge.data.data
+            if data_name in inverse_array_grad_map and inverse_array_grad_map[
+                    data_name] in self.conflicted_gradient_buffers:
+                add_wcr = True
+                # NOTE even though init_grad is called below, the gradient
+                # buffer will not actually be zeroed when
+                # self.zero_non_transients is False (this is checked in
+                # self._init_grad)
+                break
+
+            # Set the wcr to sum temporarily so that the following works
+            # Here, we are checking if there are possible conflicting writes
+            # To the same node
+            old_wcr = path_edge.data.wcr
+            path_edge.data.wcr = "lambda x, y: x + y"
+            if is_write_conflicted_with_reason(backward_state, path_edge):
+                # if we have a write conflict, we need WCR
+                add_wcr = True
+            path_edge.data.wcr = old_wcr
+            
+        # Check if any of the inputs from this accessnode will be used to contribute in a wcr way
+        if not add_wcr:
+            add_wcr = self._input_used_with_a_wcr(forward_state=forward_state, backward_node=edge.dst)
+
+        # Add WCR if necessary
+        if add_wcr:
+            for tree_edge in backward_state.memlet_tree(edge):
+                tree_edge.data.wcr = "lambda x, y: x + y"
+            self._init_grad(forward_state=forward_state, backward_state=backward_state, data_an=edge.dst)
+
     def _set_wcr_sum_if_needed(self,
                                forward_state: SDFGState,
                                backward_state: SDFGState,
@@ -2579,15 +2855,14 @@ class BackwardPassGenerator:
             :param edge: the root edge to start from
             :param summation_node: True if this node is a part of a summation node for gradient accumulation
         """
-        if not self._check_if_loop_summation_should_accumelate(backward_state, edge.dst):
-            return
+        # if not self._check_if_loop_summation_should_accumelate(backward_state, edge.dst):
+        #     return
 
         # First, we should avoid cases where we have two in edges to the same connector in this path
         for path_edge in backward_state.memlet_tree(edge):
             # Count the amount of in edges per connector
             connector_in_edges = collections.defaultdict(int)
             explored = {}
-            self.sdfg.save("log_sdfgs/before_in_edges.sdfg")
             for _, _, _, dst_conn, _ in backward_state.in_edges(path_edge.dst):
                 connector_in_edges[dst_conn] += 1
                 explored[dst_conn] = False
@@ -4725,6 +5000,70 @@ class BackwardPassGenerator:
             parent_graph = parent_graph.parent_graph
         return loop_list
 
+    def _check_overwrite_within_loop_for_accumulation(self, forward_state: SDFGState, forward_node: nodes.AccessNode, forward_loop: LoopRegion) -> bool:
+        """
+        Check if this read is followed by an overwrite of the array only within the scope of the current loop.
+        """
+        # Get the decendant states to look in for an overwrite
+        assert forward_state in self.state_order
+        index = self.state_order.index(forward_state)
+        decendant_states = self.state_order[index:]
+        
+        # Only keep states within the same loop as the target node
+        loop_states = []
+        for state in decendant_states:
+            within_loop, loop = self._state_within_loop(state)
+            if within_loop and loop == forward_loop:
+               loop_states.append(state)
+        
+        # Look for an overwrite within the leftover states
+        overwritten = False
+        decided = False
+        
+        # Check if this access node is a view
+        if type(forward_node.desc(self.sdfg)) is dt.ArrayView:
+            # The view should have one incoming edge from the original access node
+            in_edges = forward_state.in_edges(forward_node)
+
+            # Sanity checks
+            assert len(in_edges) == 1
+            assert "views" in forward_node.in_connectors
+
+            # We want to check if the source has been overwritten
+            forward_node = in_edges[0].src
+
+        # Get all the AccessNodes with the same data
+        matches = []
+        for d_state in decendant_states:
+            matches += [(nd, parent) for nd, parent in d_state.all_nodes_recursive()
+                        if isinstance(nd, nodes.AccessNode) and nd.data == forward_node.data]
+
+        # There needs to be at least one occurance which is the node passed as a parameter
+        assert len(matches) > 0 and (forward_node, forward_state) in matches
+
+        # If there is only one occurance of this data, it will not be overwritten later in the graph
+        if len(matches) == 1:
+            overwritten = False
+            decided = True
+
+        # Get the index of the parameter node
+        index = matches.index((forward_node, forward_state))
+
+        # If the parameter node is the last occurance in the decendant states,
+        # it will not be overwritten
+        if len(matches) - 1 == index:
+            overwritten = False
+            decided = True
+
+        # If we haven't already confirmed that this node has not been overwritten
+        if not decided:
+            # Iterate through all the successor occurances
+            for nd, parent in matches[index + 1:]:
+                # Check if this node has an incoming edge
+                if len(parent.in_edges(nd)) > 0:
+                    overwritten = True
+        return overwritten
+        
     def _check_node_overwrite(self, forward_state: SDFGState, node: nodes.AccessNode) -> Tuple[bool, bool]:
         """
         Given an AccessNode from the forward state, check if the data of this node has changed.
