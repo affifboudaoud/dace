@@ -234,6 +234,23 @@ def memlet_copy_to_absolute_strides(dispatcher: 'TargetDispatcher',
     return copy_shape, src_strides, dst_strides, src_expr, dst_expr
 
 
+def is_cuda_codegen_in_device(framecode) -> bool:
+    """
+    Check the state of the CUDA code generator, whether it is inside device code.
+    """
+    from dace.codegen.targets.cuda import CUDACodeGen
+    if framecode is None:
+        cuda_codegen_in_device = False
+    else:
+        for codegen in framecode.targets:
+            if isinstance(codegen, CUDACodeGen):
+                cuda_codegen_in_device = codegen._in_device_code
+                break
+        else:
+            cuda_codegen_in_device = False
+    return cuda_codegen_in_device
+
+
 def ptr(name: str, desc: data.Data, sdfg: SDFG = None, framecode=None) -> str:
     """
     Returns a string that points to the data based on its name and descriptor.
@@ -253,11 +270,10 @@ def ptr(name: str, desc: data.Data, sdfg: SDFG = None, framecode=None) -> str:
     # Special case: If memory is persistent and defined in this SDFG, add state
     # struct to name
     if (desc.transient and desc.lifetime in (dtypes.AllocationLifetime.Persistent, dtypes.AllocationLifetime.External)):
-        from dace.codegen.targets.cuda import CUDACodeGen  # Avoid import loop
 
         if desc.storage == dtypes.StorageType.CPU_ThreadLocal:  # Use unambiguous name for thread-local arrays
             return f'__{sdfg.cfg_id}_{name}'
-        elif not CUDACodeGen._in_device_code:  # GPU kernels cannot access state
+        elif not is_cuda_codegen_in_device(framecode):  # GPU kernels cannot access state
             return f'__state->__{sdfg.cfg_id}_{name}'
         elif (sdfg, name) in framecode.where_allocated and framecode.where_allocated[(sdfg, name)] is not sdfg:
             return f'__{sdfg.cfg_id}_{name}'
@@ -763,7 +779,7 @@ def is_write_conflicted_with_reason(dfg, edge, datanode=None, sdfg_schedule=None
     Detects whether a write-conflict-resolving edge can be emitted without
     using atomics or critical sections, returning the node or SDFG that caused
     the decision.
-    
+
     :return: None if the conflict is nonatomic, otherwise returns the scope entry
              node or SDFG that caused the decision to be made.
     """
@@ -1011,9 +1027,10 @@ def unparse_tasklet(sdfg, cfg, state_id, dfg, node, function_stream, callsite_st
     # To prevent variables-redefinition, build dictionary with all the previously defined symbols
     defined_symbols = state_dfg.symbols_defined_at(node)
 
-    defined_symbols.update(
-        {k: v.dtype if hasattr(v, 'dtype') else dtypes.typeclass(type(v))
-         for k, v in sdfg.constants.items()})
+    defined_symbols.update({
+        k: v.dtype if hasattr(v, 'dtype') else dtypes.typeclass(type(v))
+        for k, v in sdfg.constants.items()
+    })
 
     for connector, (memlet, _, _, conntype) in memlets.items():
         if connector is not None:
@@ -1352,8 +1369,8 @@ class DaCeKeywordRemover(ExtNodeTransformer):
                 evaluated_constant = symbolic.evaluate(unparsed, self.constants)
                 evaluated = symbolic.symstr(evaluated_constant, cpp_mode=True)
                 value = ast.parse(evaluated).body[0].value
-                if isinstance(evaluated_node, numbers.Number) and evaluated_node != (value.value if sys.version_info >=
-                                                                                     (3, 8) else value.n):
+                if isinstance(evaluated_node, numbers.Number) and evaluated_node != (value.value if sys.version_info
+                                                                                     >= (3, 8) else value.n):
                     raise TypeError
                 node.right = ast.parse(evaluated).body[0].value
             except (TypeError, AttributeError, NameError, KeyError, ValueError, SyntaxError):
