@@ -5,6 +5,7 @@ import numpy as np
 
 from dace.frontend.python.common import DaceSyntaxError
 
+
 @dace.program
 def for_loop():
     A = dace.ndarray([10], dtype=dace.int32)
@@ -211,12 +212,8 @@ def map_with_break_continue():
 
 
 def test_map_with_break_continue():
-    try:
+    with pytest.raises(DaceSyntaxError):
         map_with_break_continue()
-    except Exception as e:
-        if isinstance(e, DaceSyntaxError):
-            return 0
-    assert (False)
 
 
 @dace.program
@@ -499,6 +496,22 @@ def test_branch_in_while():
     assert len(sdfg.source_nodes()) == 1
 
 
+def test_for_with_field():
+    struct = dace.data.Structure({'data': dace.float64[20], 'length': dace.int32}, name='MyStruct')
+
+    @dace.program
+    def for_with_field(S: struct):
+        for i in range(S.length):
+            S.data[i] = S.data[i] + 1.0
+
+    A = np.random.rand(20)
+    inp_struct = struct.make_argument(data=A, length=10)
+    expected = np.copy(A)
+    expected[:10] += 1.0
+    for_with_field(inp_struct)
+    assert np.allclose(A, expected)
+
+
 if __name__ == "__main__":
     test_for_loop()
     test_for_loop_with_break_continue()
@@ -522,3 +535,4 @@ if __name__ == "__main__":
     test_while_else()
     test_branch_in_for()
     test_branch_in_while()
+    test_for_with_field()
